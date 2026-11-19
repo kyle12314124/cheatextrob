@@ -1,0 +1,23 @@
+# Build output
+build/
+out/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+
+# Runtime / per-user files
+config.ini
+diag.txt
+offsets_report.txt
+*.log
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
