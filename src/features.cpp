@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -35,7 +36,9 @@ int    g_fpsFrames = 0;
 // ---- per-frame cache (update fills it, render consumes it) ----
 bool  g_camValid = false;
 game::Camera g_cam{};
-std::vector<game::Entity> g_entities;
+std::vector<game::Entity> g_entities;   // players
+std::vector<game::Entity> g_mobs;       // non-player rigs
+std::vector<game::Entity> g_all;        // players + mobs, for draw/aim
 uintptr_t g_localTeam = 0;
 
 // ---- diag (--diag): proves whether blank ESP frames are our fault or the
@@ -121,6 +124,15 @@ uint32_t withAlpha(uint32_t argb, float a) {
            (static_cast<uint32_t>(255.0f * std::clamp(a, 0.0f, 1.0f)) << 24);
 }
 
+uint32_t lighten(uint32_t argb, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    auto ch = [&](int shift) {
+        uint32_t v = (argb >> shift) & 0xFFu;
+        return static_cast<uint32_t>(v + (255u - v) * t);
+    };
+    return (argb & 0xFF000000u) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
 void textShadow(float x, float y, const char* s, uint32_t col, float size, bool bold = false) {
     rnd::text(x + 1.0f, y + 1.0f, s, 0xC0000000, size, bold);
     rnd::text(x, y, s, col, size, bold);
@@ -145,6 +157,20 @@ void sendMouseMove(float dx, float dy) {
     in.mi.dy = static_cast<LONG>(std::lround(dy));
     in.mi.dwFlags = MOUSEEVENTF_MOVE;
     SendInput(1, &in, sizeof(INPUT));
+}
+
+void sendClick() {
+    INPUT in[2]{};
+    in[0].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, in, sizeof(INPUT));
+}
+
+bool keyDown(int vk) {
+    if (!vk) return false;
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
 // Zone comparison for games that do use Roblox teams, with a kit-signature
@@ -270,16 +296,8 @@ constexpr BoneLink kR15Links[] = {
     {game::BoneRightLowerLeg, game::BoneRightFoot},
 };
 
-constexpr BoneLink kR6Links[] = {
-    {game::BoneHead, game::BoneTorso},
-    {game::BoneTorso, game::BoneLeftArm},
-    {game::BoneTorso, game::BoneRightArm},
-    {game::BoneTorso, game::BoneLeftLeg},
-    {game::BoneTorso, game::BoneRightLeg},
-};
-
 void drawSkeleton(const game::Entity& e, const game::Vec2* pts, const bool* ok,
-                  uint32_t col, float feetY) {
+                  uint32_t col, float feetY, float thick) {
     // Each bone is extended a hair past its joints. The joints themselves are
     // never drawn, so the figure reads as continuous lines with no dots or
     // elbow/knee blobs.
@@ -291,11 +309,11 @@ void drawSkeleton(const game::Entity& e, const game::Vec2* pts, const bool* ok,
         if (len < 0.01f) return;
         const float ux = dx / len * 1.4f;
         const float uy = dy / len * 1.4f;
-        glowLine(pts[a].x - ux, pts[a].y - uy, pts[b].x + ux, pts[b].y + uy, col, 1.4f);
+        glowLine(pts[a].x - ux, pts[a].y - uy, pts[b].x + ux, pts[b].y + uy, col, thick);
     };
     auto segmentTo = [&](int a, float x, float y, float ext) {
         if (!ok[a]) return;
-        glowLine(pts[a].x, pts[a].y - ext, x, y, col, 1.4f);
+        glowLine(pts[a].x, pts[a].y - ext, x, y, col, thick);
     };
     auto midpoint = [&](int a, int b, game::Vec2& out) {
         out.x = (pts[a].x + pts[b].x) * 0.5f;
@@ -322,11 +340,11 @@ void drawSkeleton(const game::Entity& e, const game::Vec2* pts, const bool* ok,
             game::Vec2 mid{};
             if (ok[game::BoneLeftArm] && ok[game::BoneRightArm]) {
                 midpoint(game::BoneLeftArm, game::BoneRightArm, mid);
-                glowLine(pts[game::BoneTorso].x, pts[game::BoneTorso].y, mid.x, mid.y, col, 1.4f);
+                glowLine(pts[game::BoneTorso].x, pts[game::BoneTorso].y, mid.x, mid.y, col, thick);
             }
             if (ok[game::BoneLeftLeg] && ok[game::BoneRightLeg]) {
                 midpoint(game::BoneLeftLeg, game::BoneRightLeg, mid);
-                glowLine(pts[game::BoneTorso].x, pts[game::BoneTorso].y, mid.x, mid.y, col, 1.4f);
+                glowLine(pts[game::BoneTorso].x, pts[game::BoneTorso].y, mid.x, mid.y, col, thick);
             }
         }
     }
@@ -361,24 +379,79 @@ void draw3DBox(const game::Camera& cam, const game::Entity& e,
     }
 }
 
+// Edge arrow for a target that is outside the viewport. Direction comes from
+// the camera basis, so it works for targets behind the player too.
+void drawOffscreenArrow(const game::Camera& cam, const game::Entity& e,
+                        const game::Viewport& vp, uint32_t col) {
+    const Vec3 anchor = (length(e.rootPos) > 1e-3f) ? e.rootPos : e.headPos;
+    const Vec3 rel = anchor - cam.pos;
+    float x = dot(rel, cam.right);
+    float y = dot(rel, cam.up);
+    float z = dot(rel, cam.look);
+    if (z < 0.0f) { x = -x; y = -y; }   // behind: mirror through the centre
+    if (std::fabs(x) < 1e-4f && std::fabs(y) < 1e-4f) return;
+
+    const float ang = std::atan2(-y, x);
+    const float c = std::cos(ang), s = std::sin(ang);
+    const float cx = vp.x + vp.w * 0.5f;
+    const float cy = vp.y + vp.h * 0.5f;
+    const float hw = std::max(20.0f, vp.w * 0.5f - 30.0f);
+    const float hh = std::max(20.0f, vp.h * 0.5f - 30.0f);
+    const float tx = (std::fabs(c) > 1e-4f) ? hw / std::fabs(c) : 1.0e9f;
+    const float ty = (std::fabs(s) > 1e-4f) ? hh / std::fabs(s) : 1.0e9f;
+    const float t = std::min(tx, ty);
+
+    const float px = cx + c * t;
+    const float py = cy + s * t;
+    const float bx = px - c * 7.0f;
+    const float by = py - s * 7.0f;
+    const float nx = -s * 6.0f;
+    const float ny = c * 6.0f;
+    glowLine(bx + nx, by + ny, px + c * 7.0f, py + s * 7.0f, col, 1.5f);
+    glowLine(bx - nx, by - ny, px + c * 7.0f, py + s * 7.0f, col, 1.5f);
+    glowLine(bx + nx, by + ny, bx - nx, by - ny, col, 1.5f);
+}
+
 // ---- ESP ----
 
 int drawESP(const game::Camera& cam, const std::vector<game::Entity>& entities,
             const game::Viewport& vp, uintptr_t localTeam) {
     const uint32_t enemyCol = argbOf(g.espBoxColor);
     const uint32_t teamCol = argbOf(g.espTeamColor);
+    const uint32_t mobCol = argbOf(g.espMobColor);
+    const uint32_t bossCol = argbOf(g.espMobBossColor);
     int drawn = 0;
 
     for (const auto& e : entities) {
-        if (e.distance > g.espMaxDistance) continue;
+        const bool isMob = e.kind == game::Kind::Mob;
+        if (isMob && !g.espMobs) continue;
+        if (!isMob && !g.esp) continue;
 
-        const bool mate = g.espTeamCheck && sameTeam(localTeam, e);
-        const uint32_t col = mate ? teamCol : enemyCol;
+        const float maxDist = isMob ? g.espMobMaxDistance : g.espMaxDistance;
+        if (e.distance > maxDist) continue;
+
+        const bool mate = !isMob && g.espTeamCheck && sameTeam(localTeam, e);
+        const bool boss = isMob && e.label == "boss";
+        const uint32_t col = isMob ? (boss ? bossCol : mobCol) : (mate ? teamCol : enemyCol);
 
         game::Vec2 headS, rootS;
-        if (!game::worldToScreen(cam, e.headPos, vp, headS)) continue;
-        ++drawn;
+        const bool haveHead = game::worldToScreen(cam, e.headPos, vp, headS);
         const bool haveRoot = game::worldToScreen(cam, e.rootPos, vp, rootS);
+
+        const bool onScreen = haveHead &&
+            headS.x >= vp.x - 4.0f && headS.x <= vp.x + vp.w + 4.0f &&
+            headS.y >= vp.y - 4.0f && headS.y <= vp.y + vp.h + 4.0f;
+
+        float fade = 1.0f;
+        if (maxDist > 1.0f)
+            fade = std::clamp(1.0f - (e.distance / maxDist) * 0.65f, 0.45f, 1.0f);
+
+        if (!onScreen) {
+            if (g.espOffscreen)
+                drawOffscreenArrow(cam, e, vp, withAlpha(col, 0.85f * fade));
+            continue;
+        }
+        ++drawn;
 
         // Project every joint once: the skeleton uses the points and the box is
         // built from their screen extents, so it hugs arms and feet instead of a
@@ -398,10 +471,6 @@ int drawESP(const game::Camera& cam, const std::vector<game::Entity>& entities,
             maxY = std::max(maxY, pts[i].y);
         }
 
-        // Distance fade keeps far boxes from shouting over the scene.
-        float fade = 1.0f;
-        if (g.espMaxDistance > 1.0f)
-            fade = std::clamp(1.0f - (e.distance / g.espMaxDistance) * 0.65f, 0.45f, 1.0f);
         const uint32_t boxCol = withAlpha(col, fade);
 
         // Vertical extent from the real head top and the soles of the feet;
@@ -446,63 +515,82 @@ int drawESP(const game::Camera& cam, const std::vector<game::Entity>& entities,
         const float boxW = std::floor(x1 - x0 + pad * 2.0f);
         const float boxH = std::floor(y1 - y0 + pad * 2.0f);
 
-        // Snap to whole pixels. D2D antialiases a 1.5px outline across two rows,
-        // and as the box slides the coverage split changes every frame, which
-        // reads as flicker/shimmer exactly while the camera is moving. Integer
-        // geometry keeps the stroke brightness constant.
-
         // ---- box ----
         if (g.espFill)
             rnd::rect(bx, by, boxW, boxH, withAlpha(col, 0.055f), 3.0f);
 
-        if (g.espBox) {
-            switch (g.espStyle) {
+        const bool wantBox = isMob ? g.espMobBox : g.espBox;
+        if (wantBox) {
+            const int style = isMob ? g.espMobStyle : g.espStyle;
+            switch (style) {
                 case 1: drawCorners(bx, by, boxW, boxH, boxCol, mate ? 1.2f : 1.7f); break;
                 case 2: draw3DBox(cam, e, vp, boxCol); break;
                 default: glowRect(bx, by, boxW, boxH, boxCol, mate ? 1.0f : 1.4f, 2.0f); break;
             }
         }
 
-        if (g.espSkeleton) drawSkeleton(e, pts, ok, boxCol, y1);
+        const bool wantSkeleton = isMob ? g.espMobSkeleton : g.espSkeleton;
+        if (wantSkeleton)
+            drawSkeleton(e, pts, ok, boxCol, y1, std::clamp(g.espSkeletonThickness, 0.8f, 4.0f));
 
         // ---- head marker ----
-        if (g.espHeadDot && g.espBox && ok[game::BoneHead]) {
+        if (g.espHeadDot && wantBox && ok[game::BoneHead]) {
             float r = std::clamp(boxH * 0.055f, 2.0f, 5.0f);
             rnd::circle(pts[game::BoneHead].x, pts[game::BoneHead].y, r,
                         withAlpha(col, 0.9f * fade), 1.2f);
         }
 
         // ---- health bar ----
-        // Custom rigs (AnimationController, no Humanoid) have no readable
-        // health, so a bar would just sit at a fake 100 for everyone. Draw it
-        // only when the game actually exposes a Humanoid.
-        if (g.espHealth && e.humanoidAddr) {
+        const bool wantHealth = isMob ? g.espMobHealth : g.espHealth;
+        if (wantHealth && e.humanoidAddr) {
             float frac = (e.maxHealth > 0.0f) ? (e.health / e.maxHealth) : 0.0f;
             frac = std::clamp(frac, 0.0f, 1.0f);
             const float barW = std::max(2.0f, std::floor(boxW * 0.055f));
-            const float hx = std::floor(bx - barW - 4.0f);
+            const bool right = g.espHealthSide == 1;
+            const float hx = right ? std::floor(bx + boxW + 4.0f)
+                                   : std::floor(bx - barW - 4.0f);
             rnd::rect(hx - 1.0f, by - 1.0f, barW + 2.0f, boxH + 2.0f, 0x99000000, 1.0f);
-            rnd::rect(hx, by + boxH * (1.0f - frac), barW, boxH * frac,
-                      healthColor(frac), 0.0f);
-            if (g.espHealthText) {
-                char hp[16];
-                std::snprintf(hp, sizeof(hp), "%d", static_cast<int>(e.health + 0.5f));
-                textShadow(std::floor(hx - rnd::textWidth(hp, 10.0f) - 2.0f),
-                           std::floor(by), hp, withAlpha(0xFFE6E6EA, fade), 10.0f);
+
+            if (frac > 0.0f) {
+                if (g.espHealthGradient) {
+                    const uint32_t bottom = healthColor(frac);
+                    rnd::rectGradient(hx, by + boxH * (1.0f - frac), barW, boxH * frac,
+                                      lighten(bottom, 0.35f), bottom);
+                } else {
+                    rnd::rect(hx, by + boxH * (1.0f - frac), barW, boxH * frac,
+                              healthColor(frac), 0.0f);
+                }
+            }
+
+            if (g.espHealthText || g.espMaxHealth || (isMob && g.espMobHealth)) {
+                char hp[32];
+                if (g.espMaxHealth && e.maxHealth > 0.0f)
+                    std::snprintf(hp, sizeof(hp), "%d/%d", static_cast<int>(e.health + 0.5f),
+                                  static_cast<int>(e.maxHealth + 0.5f));
+                else
+                    std::snprintf(hp, sizeof(hp), "%d", static_cast<int>(e.health + 0.5f));
+                const float tw = rnd::textWidth(hp, 10.0f);
+                const float tx = right ? hx + barW + 4.0f : hx - tw - 2.0f;
+                textShadow(std::floor(tx), std::floor(by), hp,
+                           withAlpha(0xFFE6E6EA, fade), 10.0f);
             }
         }
 
-        // ---- name ----
-        // Plain outlined name by default: clean lettering that reads on bright
-        // and dark scenes. A plate is still available behind espNameBg.
-        if (g.espName && !e.name.empty()) {
+        // ---- name / mob label ----
+        const bool wantName = isMob ? (g.espMobName || g.espMobLabels) : g.espName;
+        std::string display = e.name;
+        if (isMob && g.espMobLabels && !e.label.empty()) {
+            if (display.empty()) display = "[" + e.label + "]";
+            else display = "[" + e.label + "] " + display;
+        }
+        if (wantName && !display.empty()) {
             const float fs = std::clamp(boxH * 0.14f, 10.0f, 14.0f);
             const float th = rnd::textHeight(fs);
-            float tw = rnd::textWidth(e.name.c_str(), fs, true);
+            float tw = rnd::textWidth(display.c_str(), fs, true);
             const uint32_t nameCol = withAlpha(0xFFF2F4F8, fade);
 
             if (g.espNameBg) {
-                const float maxTw = std::clamp(boxW * 1.7f, 78.0f, 180.0f);
+                const float maxTw = std::clamp(boxW * 1.7f, 78.0f, 200.0f);
                 const bool clipped = tw > maxTw;
                 if (clipped) tw = maxTw;
 
@@ -521,19 +609,31 @@ int drawESP(const game::Camera& cam, const std::vector<game::Entity>& entities,
                           withAlpha(col, 0.95f * fade), 1.0f);
 
                 if (clipped)
-                    rnd::textClipped(tx, ty, tw, e.name.c_str(), nameCol, fs, true);
+                    rnd::textClipped(tx, ty, tw, display.c_str(), nameCol, fs, true);
                 else
-                    rnd::text(tx, ty, e.name.c_str(), nameCol, fs, true);
+                    rnd::text(tx, ty, display.c_str(), nameCol, fs, true);
             } else {
                 const float nx = std::clamp(std::floor(headS.x - tw * 0.5f),
                                             vp.x + 2.0f, vp.x + vp.w - tw - 2.0f);
                 const float ny = std::floor(std::max(vp.y + 2.0f, by - th - 5.0f));
-                textOutlined(nx, ny, e.name.c_str(), nameCol, fs, true);
+                textOutlined(nx, ny, display.c_str(), nameCol, fs, true);
             }
         }
 
+        // ---- weapon / tool ----
+        if (!isMob && g.espWeapon && !e.toolName.empty()) {
+            char tool[64];
+            std::snprintf(tool, sizeof(tool), "%s", e.toolName.c_str());
+            const float tw = rnd::textWidth(tool, 9.5f);
+            const float tx = std::clamp(std::floor(headS.x - tw * 0.5f),
+                                        vp.x + 2.0f, vp.x + vp.w - tw - 2.0f);
+            const float ty = std::floor(std::max(vp.y + 2.0f, by - rnd::textHeight(9.5f) - 20.0f));
+            textShadow(tx, ty, tool, withAlpha(0xFFAEB6C2, fade), 9.5f);
+        }
+
         // ---- distance ----
-        if (g.espDistance) {
+        const bool wantDist = isMob ? g.espMobDistance : g.espDistance;
+        if (wantDist) {
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%dm", static_cast<int>(e.distance));
             const float tw = rnd::textWidth(buf, 10.5f);
@@ -543,7 +643,7 @@ int drawESP(const game::Camera& cam, const std::vector<game::Entity>& entities,
         }
 
         // ---- tracer ----
-        if (g.espTracer) {
+        if (!isMob && g.espTracer) {
             glowLine(vp.x + vp.w * 0.5f, vp.y + vp.h, headS.x, by + boxH * 0.5f,
                      withAlpha(col, 0.55f * fade), 1.0f);
         }
@@ -554,15 +654,15 @@ int drawESP(const game::Camera& cam, const std::vector<game::Entity>& entities,
 // ---- Aimbot ----
 
 uintptr_t g_localPlayer = 0;  // set by update(), used by the visibility test
-uintptr_t g_aimTarget = 0;    // sticky target (player address)
+uintptr_t g_aimTarget = 0;    // sticky target key (Player address or character)
 
-// "Visible only": every other player is treated as two spheres (torso + head)
-// and the lock is rejected when someone else sits closer to the camera along
-// the ray to the aim point. Walls and map geometry are handled by the cached
-// occluder set in world.cpp.
+// "Visible only": every other player/mob is treated as two spheres (torso +
+// head) and the lock is rejected when someone else sits closer to the camera
+// along the ray to the aim point. Walls and map geometry are handled by the
+// cached occluder set in world.cpp.
 bool aimClear(const Vec3& origin, const Vec3& point,
               const std::vector<game::Entity>& entities,
-              uintptr_t target, uintptr_t self) {
+              uintptr_t targetKey, uintptr_t self) {
     if (world::segmentBlocked(origin, point)) return false;
 
     const Vec3 seg = point - origin;
@@ -572,7 +672,8 @@ bool aimClear(const Vec3& origin, const Vec3& point,
 
     for (const auto& o : entities) {
         if (o.ghost) continue;   // streamed-out body: not at a live position
-        if (o.playerAddr == target || o.playerAddr == self) continue;
+        if (o.key() == targetKey) continue;
+        if (self && o.playerAddr == self) continue;
 
         const Vec3 centers[2] = {o.torsoPos, o.headPos};
         // Tight radii: a generous sphere rejects every ray that passes a stud
@@ -596,6 +697,7 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
     static auto lastTick = std::chrono::steady_clock::now();
     static bool clockValid = false;
     static uintptr_t lastLocked = 0;
+    static auto lastTrigger = std::chrono::steady_clock::now();
 
     if (!active) {
         g_aimTarget = 0;
@@ -625,8 +727,10 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
 
     auto evaluate = [&](const game::Entity& e, Vec3& outPos, float& outScore) -> Lock {
         if (e.ghost) return Rejected;   // streamed-out: position is not live
+        if (e.kind == game::Kind::Mob && !g.aimMobs) return Rejected;
         if (e.distance > g.aimMaxDistance) return Rejected;
-        if (g.aimTeamCheck && sameTeam(localTeam, e)) return Rejected;
+        if (e.kind == game::Kind::Player && g.aimTeamCheck && sameTeam(localTeam, e))
+            return Rejected;
 
         // Aim points in priority order: the chosen bone first, then the rest of
         // the body. Someone half behind a prop or a low wall then locks on the
@@ -644,7 +748,7 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
             if (duplicate) continue;
 
             if (g.aimPrediction > 0.0f) {
-                auto it = g_prevPos.find(e.playerAddr);
+                auto it = g_prevPos.find(e.key());
                 if (it != g_prevPos.end()) {
                     Vec3 delta = target - it->second;
                     if (length(delta) < 100.0f) target = target + delta * g.aimPrediction;
@@ -657,13 +761,17 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
             if (!game::worldToScreen(cam, target, vp, sp)) continue;
 
             if (g.aimVisibleOnly &&
-                !aimClear(origin, target, entities, e.playerAddr, g_localPlayer)) {
+                !aimClear(origin, target, entities, e.key(), g_localPlayer)) {
                 anyHidden = true;
                 continue;
             }
 
             outPos = target;
-            outScore = crosshairDistance(sp, cx, cy);
+            switch (g.aimPriority) {
+                case 1: outScore = e.distance; break;          // nearest body
+                case 2: outScore = std::max(0.0f, e.health); break; // lowest hp
+                default: outScore = crosshairDistance(sp, cx, cy); break;
+            }
             return Locked;
         }
 
@@ -673,13 +781,13 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
     const game::Entity* best = nullptr;
     Vec3 bestPos{};
 
-    // Sticky: once locked, stay on that player while they stay valid - stops the
+    // Sticky: once locked, stay on that target while it stays valid - stops the
     // crosshair dancing between two players. A hidden target does not block the
     // scan below, so the moment anyone comes into view they are locked without
     // having to re-press the key.
     if (g.aimSticky && g_aimTarget) {
         for (const auto& e : entities) {
-            if (e.playerAddr != g_aimTarget) continue;
+            if (e.key() != g_aimTarget) continue;
             Vec3 pos{};
             float score = 0.0f;
             if (evaluate(e, pos, score) == Locked) {
@@ -707,17 +815,31 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
     g_prevPos.clear();
     for (const auto& e : entities) {
         Vec3 p = bonePosition(e, g.aimBone);
-        if (length(p) > 1e-3f) g_prevPos[e.playerAddr] = p;
+        if (length(p) > 1e-3f) g_prevPos[e.key()] = p;
     }
 
     if (!best) {
         g_aimTarget = 0;
         return;
     }
-    g_aimTarget = best->playerAddr;
+    g_aimTarget = best->key();
 
     game::Vec2 sp;
     if (!game::worldToScreen(cam, bestPos, vp, sp)) return;
+
+    // Triggerbot: fire when the target sits inside the trigger radius. It runs
+    // off the real target position, not the smoothed cursor, so it still fires
+    // while the aim step is easing in.
+    if (g.aimTriggerbot && !overlay::menuOpen()) {
+        const float d = crosshairDistance(sp, cx, cy);
+        if (d <= std::max(2.0f, g.aimTriggerRadius)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastTrigger > std::chrono::milliseconds(40)) {
+                sendClick();
+                lastTrigger = now;
+            }
+        }
+    }
 
     const float smooth = std::max(1.0f, g.aimSmooth);
     const float base = 1.0f / smooth;
@@ -726,25 +848,44 @@ void runAimbot(const game::Camera& cam, const std::vector<game::Entity>& entitie
     // First frame on a new target takes a bigger bite, so the aim visibly
     // starts the moment the enemy appears instead of easing in over a few
     // frames. Tracking after that frame is untouched.
-    if (best->playerAddr != lastLocked) step = std::max(step, 0.5f);
-    lastLocked = best->playerAddr;
+    if (best->key() != lastLocked) step = std::max(step, 0.5f);
+    lastLocked = best->key();
 
-    sendMouseMove((sp.x - cx) * step, (sp.y - cy) * step);
+    float dx = (sp.x - cx) * step;
+    float dy = (sp.y - cy) * step;
+
+    // Humanization: a little random offset on the final step. Keeps a
+    // pixel-perfect snap from looking like a machine.
+    if (g.aimHumanize > 0.01f) {
+        static std::mt19937 rng{std::random_device{}()};
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        dx += dist(rng) * g.aimHumanize;
+        dy += dist(rng) * g.aimHumanize;
+    }
+
+    sendMouseMove(dx, dy);
 }
 
 // ---- memory features ----
 
+// Originals captured before the first write, restored on exit. Keeping them at
+// file scope (instead of inside applyVisuals) lets restoreVisuals put back the
+// exact values the place shipped with, not a guessed default.
+bool  g_lightSaved = false;
+float g_origBrightness = 1.0f;
+float g_origFogEnd = 100000.0f;
+bool  g_fovSaved = false;
+float g_origFovDeg = 70.0f;
+
 void applyVisuals() {
     rb::Instance lighting = rb::lighting();
     if (lighting) {
-        static bool savedLight = false;
-        static float origBrightness = 1.0f, origFogEnd = 100000.0f;
-        if (!savedLight) {
-            origBrightness = mem::g.read<float>(lighting.address() + off::LightingBrightness);
-            origFogEnd = mem::g.read<float>(lighting.address() + off::LightingFogEnd);
-            if (!(origBrightness > -100.0f && origBrightness < 100.0f)) origBrightness = 1.0f;
-            if (!(origFogEnd > 0.0f && origFogEnd < 1.0e9f)) origFogEnd = 100000.0f;
-            savedLight = true;
+        if (!g_lightSaved) {
+            g_origBrightness = mem::g.read<float>(lighting.address() + off::LightingBrightness);
+            g_origFogEnd = mem::g.read<float>(lighting.address() + off::LightingFogEnd);
+            if (!(g_origBrightness > -100.0f && g_origBrightness < 100.0f)) g_origBrightness = 1.0f;
+            if (!(g_origFogEnd > 0.0f && g_origFogEnd < 1.0e9f)) g_origFogEnd = 100000.0f;
+            g_lightSaved = true;
         }
         if (g.fullbright)
             mem::g.write<float>(lighting.address() + off::LightingBrightness, g.fullbrightValue);
@@ -757,6 +898,12 @@ void applyVisuals() {
         if (cam) {
             // Camera.FieldOfView is stored in radians. Only write when it drifts,
             // so the game's own camera script is not fought every frame.
+            if (!g_fovSaved) {
+                const float cur = mem::g.read<float>(cam.address() + off::CameraFOV);
+                const float deg = cur * (180.0f / 3.14159265358979323846f);
+                if (deg > 1.0f && deg < 179.0f) g_origFovDeg = deg;
+                g_fovSaved = true;
+            }
             float want = g.fovValue * (3.14159265358979323846f / 180.0f);
             float cur = mem::g.read<float>(cam.address() + off::CameraFOV);
             if (std::fabs(cur - want) > 0.01f)
@@ -771,15 +918,15 @@ void restoreVisuals() {
     rb::Instance lighting = rb::lighting();
     if (lighting) {
         if (g.fullbright)
-            mem::g.write<float>(lighting.address() + off::LightingBrightness, 1.0f);
+            mem::g.write<float>(lighting.address() + off::LightingBrightness, g_origBrightness);
         if (g.noFog)
-            mem::g.write<float>(lighting.address() + off::LightingFogEnd, 100000.0f);
+            mem::g.write<float>(lighting.address() + off::LightingFogEnd, g_origFogEnd);
     }
     if (g.fovChanger) {
         rb::Instance cam = rb::camera();
         if (cam)
             mem::g.write<float>(cam.address() + off::CameraFOV,
-                                70.0f * (3.14159265358979323846f / 180.0f));
+                                g_origFovDeg * (3.14159265358979323846f / 180.0f));
     }
 }
 
@@ -804,18 +951,80 @@ void applyMovement() {
         mem::g.write<float>(humanoid + off::HumanoidJumpPower, g.jumpPowerValue);
 }
 
+// ---- utility ----
+
+uintptr_t localRootPart() {
+    rb::Instance lp = rb::localPlayer();
+    if (!lp) return 0;
+    uintptr_t character = mem::g.read<uintptr_t>(lp.address() + off::PlayerModel);
+    if (!character) return 0;
+    return rb::Instance(character).findFirstChild("HumanoidRootPart").address();
+}
+
+bool teleportLocal(const Vec3& p) {
+    const uintptr_t root = localRootPart();
+    if (!root) return false;
+    const uintptr_t prim = mem::g.read<uintptr_t>(root + off::PartPrimitive);
+    if (!prim) return false;
+    return mem::g.writeRaw(prim + off::PrimitivePosition, &p, sizeof(p));
+}
+
+bool readLocalPosition(Vec3& out) {
+    const uintptr_t root = localRootPart();
+    if (!root) return false;
+    out = game::readPartPosition(root);
+    return length(out) > 1e-3f;
+}
+
+void applyUtility() {
+    // Anti-AFK: a one-pixel mouse nudge every minute. Roblox's idle counter
+    // only looks for input, so this keeps the session alive without pressing a
+    // gameplay key.
+    static ULONGLONG lastAfk = 0;
+    if (g.antiAfk) {
+        const ULONGLONG now = GetTickCount64();
+        if (!lastAfk) lastAfk = now;
+        if (now - lastAfk > 60000) {
+            lastAfk = now;
+            INPUT in{};
+            in.type = INPUT_MOUSE;
+            in.mi.dx = 1;
+            in.mi.dwFlags = MOUSEEVENTF_MOVE;
+            SendInput(1, &in, sizeof(in));
+            in.mi.dx = -1;
+            SendInput(1, &in, sizeof(in));
+        }
+    } else {
+        lastAfk = 0;
+    }
+
+    // Auto clicker: hold the bound key to click at the configured rate. It is
+    // disabled while the menu is open so it cannot fight the panel.
+    if (g.autoClick && !overlay::menuOpen() && keyDown(g.autoClickKey)) {
+        static ULONGLONG lastClick = 0;
+        const float cps = std::clamp(g.autoClickCps, 1.0f, 25.0f);
+        const ULONGLONG interval = static_cast<ULONGLONG>(1000.0f / cps);
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastClick >= interval) {
+            lastClick = now;
+            sendClick();
+        }
+    }
+}
+
 // ---- menu ----
 
-const char* const kTabs[] = {"ESP", "Aimbot", "Visuals", "Player", "Config"};
+const char* const kTabs[] = {"ESP", "Mobs", "Aimbot", "Visuals", "Player", "Config"};
 int g_tab = 0;
 
 void drawMenu() {
-    ui::panelBegin("ELYYYKKK", 64.0f, 40.0f, 660.0f, 420.0f);
-    ui::tabBar(&g_tab, kTabs, 5, g_tab);
+    ui::panelBegin("ELYYYKKK", 64.0f, 40.0f, 700.0f, 440.0f);
+    ui::tabBar(&g_tab, kTabs, 6, g_tab);
 
     switch (g_tab) {
         case 0: {
             static const char* const styles[] = {"box", "corners", "3d box"};
+            static const char* const sides[] = {"left", "right"};
             ui::columns(2);
 
             ui::section("players");
@@ -824,13 +1033,21 @@ void drawMenu() {
             ui::cycle(&g.espStyle, "style", g.espStyle, styles, 3);
             ui::checkbox(&g.espFill, "fill", g.espFill);
             ui::checkbox(&g.espSkeleton, "skeleton", g.espSkeleton);
+            if (g.espSkeleton)
+                ui::slider(&g.espSkeletonThickness, "bone thickness",
+                           g.espSkeletonThickness, 0.8f, 4.0f, "%.1f");
             ui::checkbox(&g.espName, "names", g.espName);
+            ui::checkbox(&g.espWeapon, "weapon", g.espWeapon);
             ui::checkbox(&g.espHealth, "health", g.espHealth);
+            ui::checkbox(&g.espMaxHealth, "hp / max", g.espMaxHealth);
+            ui::checkbox(&g.espHealthGradient, "health gradient", g.espHealthGradient);
+            ui::cycle(&g.espHealthSide, "health side", g.espHealthSide, sides, 2);
             ui::checkbox(&g.espDistance, "distance", g.espDistance);
 
             ui::nextColumn();
             ui::section("filter");
             ui::checkbox(&g.espTracer, "tracer", g.espTracer);
+            ui::checkbox(&g.espOffscreen, "off-screen arrows", g.espOffscreen);
             ui::checkbox(&g.espList, "player list", g.espList);
             ui::checkbox(&g.espTeamCheck, "team check", g.espTeamCheck);
             ui::checkbox(&g.espSelf, "draw self (test)", g.espSelf);
@@ -843,13 +1060,45 @@ void drawMenu() {
         }
 
         case 1: {
+            static const char* const styles[] = {"box", "corners", "3d box"};
+            ui::columns(2);
+            ui::section("mobs / npcs");
+            ui::checkbox(&g.espMobs, "enabled", g.espMobs);
+            ui::checkbox(&g.espMobBox, "box", g.espMobBox);
+            ui::cycle(&g.espMobStyle, "style", g.espMobStyle, styles, 3);
+            ui::checkbox(&g.espMobSkeleton, "skeleton", g.espMobSkeleton);
+            ui::checkbox(&g.espMobName, "name", g.espMobName);
+            ui::checkbox(&g.espMobLabels, "type tag", g.espMobLabels);
+            ui::checkbox(&g.espMobHealth, "health", g.espMobHealth);
+            ui::checkbox(&g.espMobDistance, "distance", g.espMobDistance);
+
+            ui::nextColumn();
+            ui::section("filter");
+            ui::slider(&g.espMobMaxDistance, "max distance", g.espMobMaxDistance,
+                       50.0f, 5000.0f, "%.0f");
+            ui::checkbox(&g.aimMobs, "aimbot targets mobs", g.aimMobs);
+            {
+                char info[48];
+                std::snprintf(info, sizeof(info), "%d tracked", static_cast<int>(g_mobs.size()));
+                ui::dim(info);
+            }
+
+            ui::section("colors");
+            ui::swatches(&g.espMobColor, g.espMobColor, "mob");
+            ui::swatches(&g.espMobBossColor, g.espMobBossColor, "boss");
+            break;
+        }
+
+        case 2: {
             static const char* const bones[] = {"head", "torso", "root"};
             static const char* const modes[] = {"hold", "toggle"};
+            static const char* const prio[] = {"crosshair", "distance", "lowest hp"};
 
             ui::columns(2);
             ui::section("target");
             ui::checkbox(&g.aim, "enabled", g.aim);
             ui::checkbox(&g.aimTeamCheck, "team check", g.aimTeamCheck);
+            ui::checkbox(&g.aimMobs, "target mobs", g.aimMobs);
             ui::checkbox(&g.aimVisibleOnly, "visible only", g.aimVisibleOnly);
             if (g.aimVisibleOnly) {
                 char cache[64];
@@ -861,6 +1110,7 @@ void drawMenu() {
                 ui::dim(cache);
             }
             ui::cycle(&g.aimBone, "bone", g.aimBone, bones, 3);
+            ui::cycle(&g.aimPriority, "priority", g.aimPriority, prio, 3);
             ui::cycle(&g.aimMode, "trigger", g.aimMode, modes, 2);
             ui::keybind(&g.aimKey, "aim key", g.aimKey);
             ui::checkbox(&g.aimSticky, "sticky target", g.aimSticky);
@@ -872,10 +1122,19 @@ void drawMenu() {
             ui::slider(&g.aimSmooth, "smooth", g.aimSmooth, 1.0f, 40.0f, "%.1f");
             ui::slider(&g.aimMaxDistance, "max distance", g.aimMaxDistance, 50.0f, 3000.0f, "%.0f");
             ui::slider(&g.aimPrediction, "prediction", g.aimPrediction, 0.0f, 4.0f, "%.2f");
+            ui::slider(&g.aimHumanize, "humanize", g.aimHumanize, 0.0f, 6.0f, "%.1f px");
+
+            ui::section("triggerbot");
+            ui::checkbox(&g.aimTriggerbot, "auto fire", g.aimTriggerbot);
+            if (g.aimTriggerbot)
+                ui::slider(&g.aimTriggerRadius, "radius", g.aimTriggerRadius, 2.0f, 60.0f, "%.0f px");
+
+            ui::section("fov color");
+            ui::swatches(&g.aimFovColor, g.aimFovColor, "ring");
             break;
         }
 
-        case 2:
+        case 3:
             ui::columns(2);
             ui::section("world");
             ui::checkbox(&g.fullbright, "fullbright", g.fullbright);
@@ -897,8 +1156,11 @@ void drawMenu() {
             ui::checkbox(&g.fpsCounter, "fps counter", g.fpsCounter);
             break;
 
-        case 3: {
+        case 4: {
             static int g_scanId = 0;
+            static int wpSaveId[3] = {0, 0, 0};
+            static int wpTpId[3] = {0, 0, 0};
+
             ui::columns(2);
             ui::section("movement");
             ui::checkbox(&g.walkSpeed, "walk speed", g.walkSpeed);
@@ -908,7 +1170,68 @@ void drawMenu() {
             if (g.jumpPower)
                 ui::slider(&g.jumpPowerValue, "jump", g.jumpPowerValue, 50.0f, 500.0f, "%.0f");
 
+            ui::section("utility");
+            ui::checkbox(&g.antiAfk, "anti-afk", g.antiAfk);
+            ui::checkbox(&g.autoClick, "auto clicker", g.autoClick);
+            if (g.autoClick) {
+                ui::keybind(&g.autoClickKey, "click key", g.autoClickKey);
+                ui::slider(&g.autoClickCps, "clicks / sec", g.autoClickCps, 1.0f, 25.0f, "%.0f");
+            }
+
+            static int tpEnemyId = 0;
+            if (ui::button(&tpEnemyId, "teleport to nearest enemy", 200.0f)) {
+                const game::Entity* best = nullptr;
+                float bestDist = FLT_MAX;
+                for (const auto& e : g_entities) {
+                    if (e.ghost || e.kind != game::Kind::Player) continue;
+                    if (g.espTeamCheck && sameTeam(g_localTeam, e)) continue;
+                    if (e.distance < bestDist) {
+                        bestDist = e.distance;
+                        best = &e;
+                    }
+                }
+                if (!best) {
+                    toast("no enemy found");
+                } else {
+                    Vec3 dest = best->rootPos;
+                    Vec3 local{};
+                    if (readLocalPosition(local)) {
+                        const Vec3 dir = normalize(local - dest);
+                        dest = dest + dir * 3.0f;
+                    }
+                    toast(teleportLocal(dest) ? "teleport written" : "teleport failed");
+                }
+            }
+
             ui::nextColumn();
+            ui::section("waypoints");
+            for (int i = 0; i < 3; ++i) {
+                char row[32];
+                std::snprintf(row, sizeof(row), "slot %d", i + 1);
+                ui::label(row);
+
+                if (ui::button(&wpSaveId[i], "save current", 130.0f)) {
+                    Vec3 p{};
+                    if (readLocalPosition(p)) {
+                        g.waypoint[i][0] = p.x;
+                        g.waypoint[i][1] = p.y;
+                        g.waypoint[i][2] = p.z;
+                        g.waypointSet[i] = true;
+                        toast("waypoint saved");
+                    } else {
+                        toast("no local character");
+                    }
+                }
+                if (ui::button(&wpTpId[i], "teleport", 130.0f)) {
+                    if (!g.waypointSet[i]) {
+                        toast("slot is empty");
+                    } else {
+                        Vec3 p{g.waypoint[i][0], g.waypoint[i][1], g.waypoint[i][2]};
+                        toast(teleportLocal(p) ? "teleport written" : "teleport failed");
+                    }
+                }
+            }
+
             ui::section("maintenance");
             if (ui::button(&g_scanId, "rescan offsets"))
                 rb::forceRescan();
@@ -917,7 +1240,7 @@ void drawMenu() {
             break;
         }
 
-        case 4: {
+        case 5: {
             static int saveId = 0, loadId = 0, resetId = 0;
 
             ui::columns(2);
@@ -966,8 +1289,10 @@ void drawOverlays(const game::Viewport& vp, float sw) {
 
     if (g.watermark) {
         const float x = 12.0f, y = 12.0f, h = 28.0f;
-        char count[32];
-        std::snprintf(count, sizeof(count), "%d players", static_cast<int>(g_entities.size()));
+        char count[48];
+        std::snprintf(count, sizeof(count), "%d players  %d mobs",
+                      static_cast<int>(g_entities.size()),
+                      static_cast<int>(g_mobs.size()));
 
         const float tw = rnd::textWidth("ELYYYKKK", 12.5f, true);
         const float cw = rnd::textWidth(count, 11.0f);
@@ -991,29 +1316,31 @@ void drawOverlays(const game::Viewport& vp, float sw) {
     }
 
     // ---- player list ----
-    if (g.espList && !g_entities.empty()) {
+    if (g.espList && !g_all.empty()) {
         std::vector<const game::Entity*> list;
-        list.reserve(g_entities.size());
-        for (const auto& e : g_entities) {
-            if (e.distance <= g.espMaxDistance) list.push_back(&e);
+        list.reserve(g_all.size());
+        for (const auto& e : g_all) {
+            if (e.kind == game::Kind::Mob && !g.espMobs) continue;
+            const float maxDist = e.kind == game::Kind::Mob ? g.espMobMaxDistance : g.espMaxDistance;
+            if (e.distance <= maxDist) list.push_back(&e);
         }
         std::sort(list.begin(), list.end(),
                   [](const game::Entity* a, const game::Entity* b) {
                       return a->distance < b->distance;
                   });
-        if (list.size() > 12) list.resize(12);
+        if (list.size() > 14) list.resize(14);
 
         const float x = 12.0f;
         float y = g.watermark ? 48.0f : 12.0f;
         const float rowH = 18.0f;
-        const float w = 214.0f;
+        const float w = 230.0f;
         const float h = rowH * static_cast<float>(list.size()) + 40.0f;
 
         rnd::rect(x, y, w, h, kHudBg, 8.0f);
         rnd::rectOutline(x + 0.5f, y + 0.5f, w - 1.0f, h - 1.0f, kHudEdge, 1.0f, 8.0f);
         rnd::rect(x + 12.0f, y + 0.5f, 30.0f, 2.0f, kAccent, 1.0f);
 
-        rnd::text(x + 13.0f, y + 10.0f, "PLAYERS", kHudFaint, 10.0f, true);
+        rnd::text(x + 13.0f, y + 10.0f, "ENTITIES", kHudFaint, 10.0f, true);
         char nbuf[24];
         std::snprintf(nbuf, sizeof(nbuf), "%d", static_cast<int>(list.size()));
         float nw = rnd::textWidth(nbuf, 10.0f) + 12.0f;
@@ -1022,15 +1349,27 @@ void drawOverlays(const game::Viewport& vp, float sw) {
 
         y += 28.0f;
         for (const auto* e : list) {
+            const bool isMob = e->kind == game::Kind::Mob;
             char hp[24];
             std::snprintf(hp, sizeof(hp), "%d", static_cast<int>(e->health + 0.5f));
             float frac = (e->maxHealth > 0.0f)
                              ? std::clamp(e->health / e->maxHealth, 0.0f, 1.0f)
                              : 0.0f;
 
-            rnd::rect(x + 10.0f, y + 5.0f, 2.0f, 9.0f, healthColor(frac), 1.0f);
-            rnd::textClipped(x + 18.0f, y + 1.0f, 116.0f, e->name.c_str(), kHudText, 11.5f);
-            rnd::text(x + 136.0f, y + 1.5f, hp, healthColor(frac), 10.5f);
+            const float* mobColRef = (e->label == "boss") ? g.espMobBossColor
+                                                          : g.espMobColor;
+            const uint32_t dot = isMob ? argbOf(mobColRef) : healthColor(frac);
+            rnd::rect(x + 10.0f, y + 5.0f, 2.0f, 9.0f, dot, 1.0f);
+
+            std::string name = e->name;
+            if (isMob && g.espMobLabels && !e->label.empty()) {
+                if (name.empty()) name = "[" + e->label + "]";
+                else name = "[" + e->label + "] " + name;
+            }
+            rnd::textClipped(x + 18.0f, y + 1.0f, 132.0f, name.c_str(), kHudText, 11.5f);
+
+            if (!isMob)
+                rnd::text(x + 154.0f, y + 1.5f, hp, healthColor(frac), 10.5f);
 
             char dist[24];
             std::snprintf(dist, sizeof(dist), "%dm", static_cast<int>(e->distance));
@@ -1063,9 +1402,9 @@ void drawOverlays(const game::Viewport& vp, float sw) {
                          std::tan(g.aimFov * 0.5f * 3.14159265358979323846f / 180.0f);
         radiusPx = std::clamp(radiusPx, 10.0f, vp.h);
 
+        const uint32_t ring = withAlpha(argbOf(g.aimFovColor), 0.70f);
         // dashed ring: solid rings fight with the game's own HUD
         constexpr int kDashes = 64;
-        const uint32_t ring = 0xB45E9EFF;
         for (int i = 0; i < kDashes; i += 2) {
             float a0 = (static_cast<float>(i) / kDashes) * 6.2831853f;
             float a1 = (static_cast<float>(i + 1) / kDashes) * 6.2831853f;
@@ -1110,13 +1449,19 @@ bool saveConfig() {
     writeInt(f, "espStyle", g.espStyle);
     writeBool(f, "espFill", g.espFill);
     writeBool(f, "espSkeleton", g.espSkeleton);
+    writeFloat(f, "espSkeletonThickness", g.espSkeletonThickness);
     writeBool(f, "espHeadDot", g.espHeadDot);
     writeBool(f, "espName", g.espName);
     writeBool(f, "espNameBg", g.espNameBg);
     writeBool(f, "espHealth", g.espHealth);
     writeBool(f, "espHealthText", g.espHealthText);
+    writeBool(f, "espHealthGradient", g.espHealthGradient);
+    writeBool(f, "espMaxHealth", g.espMaxHealth);
+    writeInt(f, "espHealthSide", g.espHealthSide);
+    writeBool(f, "espWeapon", g.espWeapon);
     writeBool(f, "espDistance", g.espDistance);
     writeBool(f, "espTracer", g.espTracer);
+    writeBool(f, "espOffscreen", g.espOffscreen);
     writeBool(f, "espList", g.espList);
     writeBool(f, "espTeamCheck", g.espTeamCheck);
     writeFloat(f, "espMaxDistance", g.espMaxDistance);
@@ -1129,18 +1474,45 @@ bool saveConfig() {
         writeFloat(f, k, g.espTeamColor[i]);
     }
 
+    writeBool(f, "espMobs", g.espMobs);
+    writeBool(f, "espMobBox", g.espMobBox);
+    writeInt(f, "espMobStyle", g.espMobStyle);
+    writeBool(f, "espMobSkeleton", g.espMobSkeleton);
+    writeBool(f, "espMobName", g.espMobName);
+    writeBool(f, "espMobHealth", g.espMobHealth);
+    writeBool(f, "espMobDistance", g.espMobDistance);
+    writeBool(f, "espMobLabels", g.espMobLabels);
+    writeFloat(f, "espMobMaxDistance", g.espMobMaxDistance);
+    for (int i = 0; i < 4; ++i) {
+        char k[32];
+        std::snprintf(k, sizeof(k), "espMobColor%d", i);
+        writeFloat(f, k, g.espMobColor[i]);
+        std::snprintf(k, sizeof(k), "espMobBossColor%d", i);
+        writeFloat(f, k, g.espMobBossColor[i]);
+    }
+
     writeBool(f, "aim", g.aim);
     writeBool(f, "aimTeamCheck", g.aimTeamCheck);
     writeBool(f, "aimVisibleOnly", g.aimVisibleOnly);
+    writeBool(f, "aimMobs", g.aimMobs);
     writeFloat(f, "aimFov", g.aimFov);
     writeFloat(f, "aimSmooth", g.aimSmooth);
     writeInt(f, "aimKey", g.aimKey);
     writeInt(f, "aimMode", g.aimMode);
     writeInt(f, "aimBone", g.aimBone);
+    writeInt(f, "aimPriority", g.aimPriority);
     writeFloat(f, "aimMaxDistance", g.aimMaxDistance);
     writeFloat(f, "aimPrediction", g.aimPrediction);
+    writeFloat(f, "aimHumanize", g.aimHumanize);
     writeBool(f, "aimSticky", g.aimSticky);
     writeBool(f, "aimFovCircle", g.aimFovCircle);
+    writeBool(f, "aimTriggerbot", g.aimTriggerbot);
+    writeFloat(f, "aimTriggerRadius", g.aimTriggerRadius);
+    for (int i = 0; i < 4; ++i) {
+        char k[32];
+        std::snprintf(k, sizeof(k), "aimFovColor%d", i);
+        writeFloat(f, k, g.aimFovColor[i]);
+    }
 
     writeBool(f, "fullbright", g.fullbright);
     writeFloat(f, "fullbrightValue", g.fullbrightValue);
@@ -1154,6 +1526,20 @@ bool saveConfig() {
     writeFloat(f, "walkSpeedValue", g.walkSpeedValue);
     writeBool(f, "jumpPower", g.jumpPower);
     writeFloat(f, "jumpPowerValue", g.jumpPowerValue);
+
+    writeBool(f, "antiAfk", g.antiAfk);
+    writeBool(f, "autoClick", g.autoClick);
+    writeInt(f, "autoClickKey", g.autoClickKey);
+    writeFloat(f, "autoClickCps", g.autoClickCps);
+    for (int i = 0; i < 3; ++i) {
+        char k[32];
+        std::snprintf(k, sizeof(k), "waypointSet%d", i);
+        writeBool(f, k, g.waypointSet[i]);
+        for (int a = 0; a < 3; ++a) {
+            std::snprintf(k, sizeof(k), "waypoint%d_%d", i, a);
+            writeFloat(f, k, g.waypoint[i][a]);
+        }
+    }
 
     writeBool(f, "watermark", g.watermark);
     writeBool(f, "fpsCounter", g.fpsCounter);
@@ -1188,13 +1574,19 @@ bool loadConfig() {
         else if (keyIs(key, "espStyle")) g.espStyle = std::clamp(i, 0, 2);
         else if (keyIs(key, "espFill")) g.espFill = b;
         else if (keyIs(key, "espSkeleton")) g.espSkeleton = b;
+        else if (keyIs(key, "espSkeletonThickness")) g.espSkeletonThickness = std::clamp(v, 0.8f, 4.0f);
         else if (keyIs(key, "espHeadDot")) g.espHeadDot = b;
         else if (keyIs(key, "espName")) g.espName = b;
         else if (keyIs(key, "espNameBg")) g.espNameBg = b;
         else if (keyIs(key, "espHealth")) g.espHealth = b;
         else if (keyIs(key, "espHealthText")) g.espHealthText = b;
+        else if (keyIs(key, "espHealthGradient")) g.espHealthGradient = b;
+        else if (keyIs(key, "espMaxHealth")) g.espMaxHealth = b;
+        else if (keyIs(key, "espHealthSide")) g.espHealthSide = std::clamp(i, 0, 1);
+        else if (keyIs(key, "espWeapon")) g.espWeapon = b;
         else if (keyIs(key, "espDistance")) g.espDistance = b;
         else if (keyIs(key, "espTracer")) g.espTracer = b;
+        else if (keyIs(key, "espOffscreen")) g.espOffscreen = b;
         else if (keyIs(key, "espList")) g.espList = b;
         else if (keyIs(key, "espTeamCheck")) g.espTeamCheck = b;
         else if (keyIs(key, "espMaxDistance")) g.espMaxDistance = std::clamp(v, 50.0f, 5000.0f);
@@ -1207,18 +1599,44 @@ bool loadConfig() {
         else if (keyIs(key, "espTeamColor1")) g.espTeamColor[1] = std::clamp(v, 0.0f, 1.0f);
         else if (keyIs(key, "espTeamColor2")) g.espTeamColor[2] = std::clamp(v, 0.0f, 1.0f);
         else if (keyIs(key, "espTeamColor3")) g.espTeamColor[3] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobs")) g.espMobs = b;
+        else if (keyIs(key, "espMobBox")) g.espMobBox = b;
+        else if (keyIs(key, "espMobStyle")) g.espMobStyle = std::clamp(i, 0, 2);
+        else if (keyIs(key, "espMobSkeleton")) g.espMobSkeleton = b;
+        else if (keyIs(key, "espMobName")) g.espMobName = b;
+        else if (keyIs(key, "espMobHealth")) g.espMobHealth = b;
+        else if (keyIs(key, "espMobDistance")) g.espMobDistance = b;
+        else if (keyIs(key, "espMobLabels")) g.espMobLabels = b;
+        else if (keyIs(key, "espMobMaxDistance")) g.espMobMaxDistance = std::clamp(v, 50.0f, 5000.0f);
+        else if (keyIs(key, "espMobColor0")) g.espMobColor[0] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobColor1")) g.espMobColor[1] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobColor2")) g.espMobColor[2] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobColor3")) g.espMobColor[3] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobBossColor0")) g.espMobBossColor[0] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobBossColor1")) g.espMobBossColor[1] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobBossColor2")) g.espMobBossColor[2] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "espMobBossColor3")) g.espMobBossColor[3] = std::clamp(v, 0.0f, 1.0f);
         else if (keyIs(key, "aim")) g.aim = b;
         else if (keyIs(key, "aimTeamCheck")) g.aimTeamCheck = b;
         else if (keyIs(key, "aimVisibleOnly")) g.aimVisibleOnly = b;
+        else if (keyIs(key, "aimMobs")) g.aimMobs = b;
         else if (keyIs(key, "aimFov")) g.aimFov = std::clamp(v, 5.0f, 360.0f);
         else if (keyIs(key, "aimSmooth")) g.aimSmooth = std::clamp(v, 1.0f, 40.0f);
         else if (keyIs(key, "aimKey")) g.aimKey = i;
         else if (keyIs(key, "aimMode")) g.aimMode = std::clamp(i, 0, 1);
         else if (keyIs(key, "aimBone")) g.aimBone = std::clamp(i, 0, 2);
+        else if (keyIs(key, "aimPriority")) g.aimPriority = std::clamp(i, 0, 2);
         else if (keyIs(key, "aimMaxDistance")) g.aimMaxDistance = std::clamp(v, 50.0f, 3000.0f);
         else if (keyIs(key, "aimPrediction")) g.aimPrediction = std::clamp(v, 0.0f, 4.0f);
+        else if (keyIs(key, "aimHumanize")) g.aimHumanize = std::clamp(v, 0.0f, 6.0f);
         else if (keyIs(key, "aimSticky")) g.aimSticky = b;
         else if (keyIs(key, "aimFovCircle")) g.aimFovCircle = b;
+        else if (keyIs(key, "aimTriggerbot")) g.aimTriggerbot = b;
+        else if (keyIs(key, "aimTriggerRadius")) g.aimTriggerRadius = std::clamp(v, 2.0f, 60.0f);
+        else if (keyIs(key, "aimFovColor0")) g.aimFovColor[0] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "aimFovColor1")) g.aimFovColor[1] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "aimFovColor2")) g.aimFovColor[2] = std::clamp(v, 0.0f, 1.0f);
+        else if (keyIs(key, "aimFovColor3")) g.aimFovColor[3] = std::clamp(v, 0.0f, 1.0f);
         else if (keyIs(key, "fullbright")) g.fullbright = b;
         else if (keyIs(key, "fullbrightValue")) g.fullbrightValue = std::clamp(v, 0.0f, 10.0f);
         else if (keyIs(key, "noFog")) g.noFog = b;
@@ -1230,6 +1648,22 @@ bool loadConfig() {
         else if (keyIs(key, "walkSpeedValue")) g.walkSpeedValue = std::clamp(v, 16.0f, 500.0f);
         else if (keyIs(key, "jumpPower")) g.jumpPower = b;
         else if (keyIs(key, "jumpPowerValue")) g.jumpPowerValue = std::clamp(v, 50.0f, 500.0f);
+        else if (keyIs(key, "antiAfk")) g.antiAfk = b;
+        else if (keyIs(key, "autoClick")) g.autoClick = b;
+        else if (keyIs(key, "autoClickKey")) g.autoClickKey = i;
+        else if (keyIs(key, "autoClickCps")) g.autoClickCps = std::clamp(v, 1.0f, 25.0f);
+        else if (keyIs(key, "waypointSet0")) g.waypointSet[0] = b;
+        else if (keyIs(key, "waypointSet1")) g.waypointSet[1] = b;
+        else if (keyIs(key, "waypointSet2")) g.waypointSet[2] = b;
+        else if (keyIs(key, "waypoint0_0")) g.waypoint[0][0] = v;
+        else if (keyIs(key, "waypoint0_1")) g.waypoint[0][1] = v;
+        else if (keyIs(key, "waypoint0_2")) g.waypoint[0][2] = v;
+        else if (keyIs(key, "waypoint1_0")) g.waypoint[1][0] = v;
+        else if (keyIs(key, "waypoint1_1")) g.waypoint[1][1] = v;
+        else if (keyIs(key, "waypoint1_2")) g.waypoint[1][2] = v;
+        else if (keyIs(key, "waypoint2_0")) g.waypoint[2][0] = v;
+        else if (keyIs(key, "waypoint2_1")) g.waypoint[2][1] = v;
+        else if (keyIs(key, "waypoint2_2")) g.waypoint[2][2] = v;
         else if (keyIs(key, "watermark")) g.watermark = b;
         else if (keyIs(key, "fpsCounter")) g.fpsCounter = b;
     }
@@ -1359,6 +1793,35 @@ void update(int surfaceW, int surfaceH) {
             ++g_diagEntDrop;
         }
 
+        // Feed the mob walker the exact player models so it never classifies a
+        // player character as an NPC. The local model goes in even when espSelf
+        // is off.
+        {
+            std::vector<uintptr_t> chars;
+            chars.reserve(g_entities.size() + 1);
+            const uintptr_t localModel =
+                g_localPlayer ? mem::g.read<uintptr_t>(g_localPlayer + off::PlayerModel) : 0;
+            if (localModel) chars.push_back(localModel);
+            for (const auto& e : g_entities)
+                if (e.characterAddr) chars.push_back(e.characterAddr);
+            game::setPlayerCharacters(chars);
+        }
+        game::setReadTools(g.espWeapon);
+
+        if (g.espMobs || g.aimMobs || (g.aim && g.aimVisibleOnly)) {
+            size_t mobsSeen = 0;
+            g_mobs = game::collectMobs(g_cam, &mobsSeen);
+        } else {
+            g_mobs.clear();
+        }
+
+        // One merged view for the ESP, aimbot and entity list. The strings are
+        // already in the snapshots; the copy is cheap next to the reads.
+        g_all.clear();
+        g_all.reserve(g_entities.size() + g_mobs.size());
+        for (const auto& e : g_entities) g_all.push_back(e);
+        for (const auto& e : g_mobs) g_all.push_back(e);
+
         auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(
                           std::chrono::steady_clock::now() - t0).count();
         avgCostMs = avgCostMs * 0.85f + static_cast<float>(costUs) * 0.001f * 0.15f;
@@ -1383,12 +1846,11 @@ void update(int surfaceW, int surfaceH) {
         // parent characters under a folder, so class-based detection misses them
         // and their own hitboxes would block every ray.
         std::vector<uintptr_t> chars;
-        chars.reserve(g_entities.size() + 1);
-        if (g_localPlayer) {
-            const uintptr_t m = mem::g.read<uintptr_t>(g_localPlayer + off::PlayerModel);
-            if (m) chars.push_back(m);
-        }
-        for (const auto& e : g_entities)
+        chars.reserve(g_all.size() + 1);
+        const uintptr_t localModel =
+            g_localPlayer ? mem::g.read<uintptr_t>(g_localPlayer + off::PlayerModel) : 0;
+        if (localModel) chars.push_back(localModel);
+        for (const auto& e : g_all)
             if (e.characterAddr) chars.push_back(e.characterAddr);
         world::setCharacters(chars);
 
@@ -1397,7 +1859,7 @@ void update(int surfaceW, int surfaceH) {
 
     if (g.aim) {
         const auto aimStart = std::chrono::steady_clock::now();
-        runAimbot(g_cam, g_entities, game::robloxViewport(), g_localTeam, aiming);
+        runAimbot(g_cam, g_all, game::robloxViewport(), g_localTeam, aiming);
         const float aimMs = std::chrono::duration<float, std::milli>(
                                 std::chrono::steady_clock::now() - aimStart).count();
         g_diagAimMs = g_diagAimMs * 0.9f + aimMs * 0.1f;
@@ -1405,6 +1867,7 @@ void update(int surfaceW, int surfaceH) {
 
     applyVisuals();
     applyMovement();
+    applyUtility();
 }
 
 void render(int surfaceW, int surfaceH) {
@@ -1413,10 +1876,10 @@ void render(int surfaceW, int surfaceH) {
     game::Viewport vp = game::robloxViewport();
 
     int boxes = 0;
-    if (mem::g.valid() && g_camValid && g.esp)
-        boxes = drawESP(g_cam, g_entities, vp, g_localTeam);
+    if (mem::g.valid() && g_camValid)
+        boxes = drawESP(g_cam, g_all, vp, g_localTeam);
 
-    diagTick(g_camValid, boxes, static_cast<int>(g_entities.size()));
+    diagTick(g_camValid, boxes, static_cast<int>(g_all.size()));
 
     drawOverlays(vp, sw);
 

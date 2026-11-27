@@ -42,7 +42,10 @@ enum Bone : int {
     BoneCount
 };
 
+enum class Kind : uint8_t { Player = 0, Mob = 1 };
+
 struct Entity {
+    Kind kind = Kind::Player;
     uintptr_t playerAddr = 0;
     uintptr_t characterAddr = 0;
     uintptr_t humanoidAddr = 0;
@@ -51,6 +54,8 @@ struct Entity {
     uintptr_t torsoAddr = 0;
     uintptr_t teamAddr = 0;
     std::string name;
+    std::string label;      // "player", or the mob classification
+    std::string toolName;   // equipped Tool, when enabled
     float health = 100.0f;
     float maxHealth = 100.0f;
     Vec3 headPos{};
@@ -65,6 +70,11 @@ struct Entity {
     bool ghost = false;      // streamed out: position is no longer being updated
     float distance = 0.0f;
     std::string teamSig;     // kit/uniform signature, used when the game has no Roblox Team
+
+    // Stable identity for sticky targeting and prediction. Mobs have no Player
+    // object, so the character model is the key.
+    uintptr_t key() const { return playerAddr ? playerAddr : characterAddr; }
+    float height() const { return boxTop.y - boxBottom.y; }
 };
 
 // Sorted, cached signature of the character's kit parts (armour model, uniform
@@ -82,7 +92,32 @@ uintptr_t readPrimitive(uintptr_t part);
 // "nobody loaded yet" apart from "we left the game".
 std::vector<Entity> collectEntities(const Camera& cam, bool includeLocal = false,
                                     size_t* playersSeen = nullptr);
+
+// Enumerates non-player humanoid rigs (mobs, NPCs, bosses, dummies). The
+// Workspace is walked incrementally in the background so the frame cost stays
+// bounded even on maps with tens of thousands of parts. Mob details are
+// rebuilt on a slow cadence; between rebuilds the cached positions are reused
+// and only the camera distance is refreshed.
+std::vector<Entity> collectMobs(const Camera& cam, size_t* mobsSeen = nullptr);
+
+// Same detection, but walks the whole Workspace synchronously and returns the
+// finished list. Only for the --scan diagnostic: it blocks for the length of a
+// full walk, which is fine on a command-line dump and never in a frame.
+std::vector<Entity> collectMobsNow(const Camera& cam, size_t* mobsSeen = nullptr);
+
 Entity buildEntity(const rb::Instance& player);
+
+// Builds an entity from a character model directly. Players pass their Player
+// address; mobs leave it zero. wantTeamSig/wantTool gate the extra child walks
+// so a mob scan never pays for player-only data.
+Entity buildModelEntity(uintptr_t character, const std::string& name,
+                        uintptr_t playerAddr, uintptr_t teamAddr,
+                        bool wantTeamSig, bool wantTool);
+
+// Character models the mob walker must never classify as a mob. Fed from the
+// current player snapshot every refresh.
+void setPlayerCharacters(const std::vector<uintptr_t>& models);
+void setReadTools(bool on);
 
 float readHumanoidHealth(uintptr_t humanoid, float& maxHealth);
 uintptr_t localTeamAddress();

@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <vector>
 #include <windows.h>
 #include <shellapi.h>
 
@@ -92,6 +93,18 @@ int scan() {
                 static_cast<unsigned long long>(rb::localPlayer().address()));
             auto plist = players.children();
             out("player count: %zu\n", plist.size());
+
+            // Feed the mob walker the player models so no Player character is
+            // ever listed as a mob in the dump below.
+            {
+                std::vector<uintptr_t> pchars;
+                pchars.reserve(plist.size());
+                for (const auto& p : plist) {
+                    uintptr_t ch = mem::g.read<uintptr_t>(p.address() + off::PlayerModel);
+                    if (ch) pchars.push_back(ch);
+                }
+                game::setPlayerCharacters(pchars);
+            }
             for (const auto& p : plist) {
                 if (p.className() != "Player") continue;
                 uintptr_t character = mem::g.read<uintptr_t>(p.address() + off::PlayerModel);
@@ -158,6 +171,24 @@ int scan() {
         out("\noccluders: %zu cached, %zu parts walked, %lldms\n",
             world::occluders(), world::partsSeen(),
             static_cast<long long>(occMs));
+
+        // Mob / NPC detection. collectMobsNow drives the same Workspace walk to
+        // completion, so the dump lists everything the live overlay would draw.
+        game::Camera mobCam{};
+        game::readCamera(mobCam);
+        auto mobStart = std::chrono::steady_clock::now();
+        size_t mobCount = 0;
+        auto mobs = game::collectMobsNow(mobCam, &mobCount);
+        auto mobMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - mobStart).count();
+        out("\nmobs: %zu detected (%lldms)\n", mobs.size(),
+            static_cast<long long>(mobMs));
+        for (const auto& e : mobs) {
+            out("  %-20s [%s] model=0x%016llX hp=%.0f/%.0f dist=%.0f\n",
+                e.name.empty() ? "(unnamed)" : e.name.c_str(), e.label.c_str(),
+                static_cast<unsigned long long>(e.characterAddr),
+                e.health, e.maxHealth, e.distance);
+        }
     } else {
         rc = 2;
         out("\noffsets stale: FakeDataModel / RealDataModel / instance layout\n");

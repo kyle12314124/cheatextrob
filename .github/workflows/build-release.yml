@@ -1,0 +1,56 @@
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (e.g. v1.1.0)"
+        required: true
+        default: "v1.1.0"
+      notes:
+        description: "Release notes (optional)"
+        required: false
+        default: "Mob/NPC ESP, expanded ESP + aimbot options, utility features."
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (MSVC x64)
+        run: cmake -S . -B build -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release
+
+      - name: Locate binary
+        id: bin
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build -Recurse -Filter RobloxExt.exe |
+                 Select-Object -First 1
+          if (-not $exe) { throw "RobloxExt.exe not found" }
+          Write-Output "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RobloxExt
+          path: ${{ steps.bin.outputs.path }}
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          name: ELYYYKKK ${{ inputs.version || github.ref_name }}
+          body: ${{ inputs.notes || 'Automated build.' }}
+          files: ${{ steps.bin.outputs.path }}
+          fail_on_unmatched_files: true

@@ -2,7 +2,9 @@
 #include "offsets.h"
 #include <cmath>
 #include <cstring>
+#include <cctype>
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -11,7 +13,40 @@
 namespace game {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
 constexpr size_t kMaxPlayers = 256;
+
+// ---- mob scan tuning ----
+// Mobs are found by walking Workspace the same way world.cpp walks it for
+// occluders: a small time budget per frame, a bounded queue and a bounded
+// result set. The details of each mob are rebuilt on a slower cadence than the
+// player list; a mob that moves at 10 Hz still reads correctly and the frame
+// never pays for a full character read of every NPC on the map.
+constexpr int    kMobMaxDepth      = 6;
+constexpr size_t kMobMaxModels     = 128;
+constexpr size_t kMobMaxQueue      = 60000;
+constexpr double kMobWalkBudgetMs  = 0.60;
+constexpr auto   kMobRebuildAfter  = std::chrono::seconds(15);
+constexpr auto   kMobEntityRefresh = std::chrono::milliseconds(90);
+
+bool g_readTools = false;
+std::vector<uintptr_t> g_playerChars;
+
+struct MobNode { uintptr_t addr; int depth; };
+std::vector<uintptr_t> g_mobModels;
+std::vector<uintptr_t> g_mobBuild;
+std::vector<MobNode>   g_mobQueue;
+size_t g_mobCursor = 0;
+bool   g_mobWalking = false;
+bool   g_mobReady = false;
+Clock::time_point g_mobReadyAt{};
+bool g_mobHaveReadyAt = false;
+
+double millisSince(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+}
 
 Vec3 readPartSize(uintptr_t part) {
     uintptr_t prim = mem::g.read<uintptr_t>(part + off::PartPrimitive);
@@ -78,6 +113,145 @@ std::string kitSignature(const std::vector<rb::Instance>& kids) {
     }
     return sig;
 }
+
+bool isPlayerCharacter(uintptr_t addr) {
+    for (uintptr_t p : g_playerChars)
+        if (p == addr) return true;
+    return false;
+}
+
+std::string lowerCopy(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Name/size/health heuristics. No game-specific tables: the common Roblox NPC
+// names are covered, and anything unknown still shows as a generic mob.
+std::string classifyMob(const std::string& name, float maxHp, float height) {
+    const std::string l = lowerCopy(name);
+    auto has = [&](const char* s) { return l.find(s) != std::string::npos; };
+
+    if (has("boss") || has("titan") || has("dragon") || has("giant") || has("king") ||
+        height > 12.0f)
+        return "boss";
+    if (has("zombie") || has("undead") || has("walker") || has("ghoul")) return "zombie";
+    if (has("skeleton") || has("skull")) return "skeleton";
+    if (has("golem") || has("robot") || has("mech") || has("droid") || has("turret"))
+        return "golem";
+    if (has("slime") || has("blob")) return "slime";
+    if (has("spider") || has("wolf") || has("bear") || has("snake") || has("shark") ||
+        has("animal") || has("dog") || has("cat"))
+        return "animal";
+    if (has("guard") || has("soldier") || has("enemy") || has("npc") || has("dummy") ||
+        has("raider") || has("bandit"))
+        return "npc";
+    if (maxHp >= 1000.0f) return "elite";
+    return "mob";
+}
+
+// A rig owns either a Humanoid or the classic HumanoidRootPart + Head pair.
+// The child count guard keeps name reads off large map folders.
+bool looksLikeRig(const std::vector<rb::Instance>& kids) {
+    if (kids.size() < 4 || kids.size() > 200) return false;
+    bool humanoid = false, root = false, head = false, torso = false;
+    for (const auto& c : kids) {
+        const std::string n = c.name();
+        if (n == "Humanoid") humanoid = true;
+        else if (n == "HumanoidRootPart") root = true;
+        else if (n == "Head") head = true;
+        else if (n == "Torso" || n == "UpperTorso" || n == "LowerTorso") torso = true;
+    }
+    // Humanoid rigs are the common case. The other two patterns cover custom
+    // NPC rigs (AnimationController instead of Humanoid) and the classic
+    // Head + Torso + limbs layout without a HumanoidRootPart.
+    return humanoid || (root && head) || (head && torso && kids.size() >= 6);
+}
+
+void mobVisit(uintptr_t addr, int depth) {
+    if (isPlayerCharacter(addr)) return;
+
+    std::vector<rb::Instance> kids = rb::Instance(addr).children();
+
+    // The root is Workspace itself; it is never a rig or a part. Checking those
+    // on it would let a stray pointer at the BasePart offset kill the whole walk.
+    if (depth > 0 && looksLikeRig(kids)) {
+        if (g_mobBuild.size() < kMobMaxModels) g_mobBuild.push_back(addr);
+        return;
+    }
+
+    // Parts are leaves. A stray pointer here is rare enough that the lost
+    // branch costs less than validating every primitive on every node.
+    if (depth > 0 && mem::g.read<uintptr_t>(addr + off::PartPrimitive)) return;
+
+    if (kids.empty() || depth >= kMobMaxDepth) return;
+    for (const auto& c : kids)
+        if (g_mobQueue.size() < kMobMaxQueue)
+            g_mobQueue.push_back({c.address(), depth + 1});
+}
+
+bool mobStartWalk() {
+    rb::Instance ws = rb::workspace();
+    if (!ws) return false;
+    g_mobBuild.clear();
+    g_mobQueue.clear();
+    g_mobQueue.push_back({ws.address(), 0});
+    g_mobCursor = 0;
+    g_mobWalking = true;
+    return true;
+}
+
+void mobWalkStep() {
+    const auto t0 = Clock::now();
+    size_t done = 0;
+    while (g_mobCursor < g_mobQueue.size()) {
+        const MobNode n = g_mobQueue[g_mobCursor++];
+        mobVisit(n.addr, n.depth);
+        ++done;
+        if (done >= 2 && millisSince(t0) >= kMobWalkBudgetMs) break;
+        if (g_mobBuild.size() >= kMobMaxModels) break;
+    }
+
+    if (g_mobCursor < g_mobQueue.size() && g_mobBuild.size() < kMobMaxModels) return;
+
+    std::vector<uintptr_t> valid;
+    valid.reserve(g_mobBuild.size());
+    for (uintptr_t m : g_mobBuild) {
+        if (!m || isPlayerCharacter(m)) continue;
+        if (rb::Instance(m).className().empty()) continue;
+        valid.push_back(m);
+    }
+    g_mobModels.swap(valid);
+    g_mobBuild.clear();
+    g_mobQueue.clear();
+    g_mobCursor = 0;
+    g_mobWalking = false;
+    g_mobReady = true;
+    g_mobReadyAt = Clock::now();
+    g_mobHaveReadyAt = true;
+}
+
+// Reads the cached mob model list into full entities. Shared by the per-frame
+// path and the synchronous --scan path so both apply the same sanity checks and
+// classification.
+std::vector<Entity> buildMobEntities(const Camera& cam) {
+    std::vector<Entity> fresh;
+    fresh.reserve(g_mobModels.size());
+    for (uintptr_t m : g_mobModels) {
+        if (!m || isPlayerCharacter(m)) continue;
+        Entity e = buildModelEntity(m, rb::Instance(m).name(), 0, 0, false, false);
+        if (!e.characterAddr || !e.headAddr) continue;
+        if (e.humanoidAddr && e.health <= 0.0f) continue;
+        if (length(e.headPos) < 1e-3f && length(e.rootPos) < 1e-3f) continue;
+        if (!e.humanoidAddr && e.height() < 1.0f) continue;
+        e.kind = Kind::Mob;
+        e.label = classifyMob(e.name, e.maxHealth, e.height());
+        e.distance = length((length(e.rootPos) > 1e-3f ? e.rootPos : e.headPos) - cam.pos);
+        fresh.push_back(std::move(e));
+    }
+    return fresh;
+}
+
 } // namespace
 
 std::string teamSignature(uintptr_t character) {
@@ -239,17 +413,17 @@ int boneFromPartName(const std::string& n) {
     return -1;
 }
 
-Entity buildEntity(const rb::Instance& player) {
+Entity buildModelEntity(uintptr_t character, const std::string& name,
+                        uintptr_t playerAddr, uintptr_t teamAddr,
+                        bool wantTeamSig, bool wantTool) {
     Entity e;
-    if (!player) return e;
-
-    e.playerAddr = player.address();
-    e.name = player.name();
-    e.teamAddr = mem::g.read<uintptr_t>(player.address() + off::PlayerTeam);
-
-    uintptr_t character = mem::g.read<uintptr_t>(player.address() + off::PlayerModel);
     if (!character) return e;
+
+    e.kind = Kind::Player;
+    e.playerAddr = playerAddr;
     e.characterAddr = character;
+    e.name = name;
+    e.teamAddr = teamAddr;
 
     // One pass over the character's children. findFirstChild() per part walked
     // the whole child list every time (4 walks); this walks it once and also
@@ -260,14 +434,16 @@ Entity buildEntity(const rb::Instance& player) {
     // by address and only rebuild when the child count changes (respawn into a
     // new body, or the rig still loading). Keyed on the count so a recycled
     // address with a different rig is never trusted.
-    static std::unordered_map<uintptr_t, std::pair<size_t, std::string>> kitCache;
-    auto kitIt = kitCache.find(character);
-    if (kitIt != kitCache.end() && kitIt->second.first == kids.size()) {
-        e.teamSig = kitIt->second.second;
-    } else {
-        e.teamSig = kitSignature(kids);
-        if (kitCache.size() > 1024) kitCache.clear();
-        kitCache[character] = {kids.size(), e.teamSig};
+    if (wantTeamSig) {
+        static std::unordered_map<uintptr_t, std::pair<size_t, std::string>> kitCache;
+        auto kitIt = kitCache.find(character);
+        if (kitIt != kitCache.end() && kitIt->second.first == kids.size()) {
+            e.teamSig = kitIt->second.second;
+        } else {
+            e.teamSig = kitSignature(kids);
+            if (kitCache.size() > 1024) kitCache.clear();
+            kitCache[character] = {kids.size(), e.teamSig};
+        }
     }
 
     uintptr_t partAddr[BoneCount]{};
@@ -278,6 +454,7 @@ Entity buildEntity(const rb::Instance& player) {
         if (n.empty()) continue;
         if (n == "Humanoid") { humanoid = c.address(); continue; }
         if (n == "HumanoidRootPart") { root = c.address(); continue; }
+        if (wantTool && c.className() == "Tool") { e.toolName = n; continue; }
         int b = boneFromPartName(n);
         if (b >= 0) partAddr[b] = c.address();
     }
@@ -354,6 +531,24 @@ Entity buildEntity(const rb::Instance& player) {
     return e;
 }
 
+Entity buildEntity(const rb::Instance& player) {
+    Entity e;
+    if (!player) return e;
+
+    e.playerAddr = player.address();
+    e.name = player.name();
+    e.teamAddr = mem::g.read<uintptr_t>(player.address() + off::PlayerTeam);
+
+    uintptr_t character = mem::g.read<uintptr_t>(player.address() + off::PlayerModel);
+    if (!character) return e;
+
+    Entity built = buildModelEntity(character, e.name, e.playerAddr, e.teamAddr,
+                                    true, g_readTools);
+    built.kind = Kind::Player;
+    built.label = "player";
+    return built;
+}
+
 std::vector<Entity> collectEntities(const Camera& cam, bool includeLocal, size_t* playersSeen) {
     std::vector<Entity> out;
     if (playersSeen) *playersSeen = 0;
@@ -397,6 +592,78 @@ std::vector<Entity> collectEntities(const Camera& cam, bool includeLocal, size_t
     }
     return out;
 }
+
+std::vector<Entity> collectMobs(const Camera& cam, size_t* mobsSeen) {
+    std::vector<Entity> out;
+    if (mobsSeen) *mobsSeen = 0;
+    if (!mem::g.valid()) return out;
+
+    static std::vector<Entity> cache;
+    static Clock::time_point lastBuild{};
+
+    // Left the place: drop the scan and the cached bodies instead of drawing
+    // boxes from the previous server until the next rebuild.
+    if (!rb::workspace()) {
+        g_mobModels.clear();
+        g_mobBuild.clear();
+        g_mobQueue.clear();
+        g_mobCursor = 0;
+        g_mobWalking = false;
+        g_mobReady = false;
+        g_mobHaveReadyAt = false;
+        cache.clear();
+        lastBuild = Clock::time_point{};
+        return out;
+    }
+
+    if (mobsSeen) *mobsSeen = g_mobModels.size();
+
+    if (g_mobWalking) {
+        mobWalkStep();
+    } else if (!g_mobReady) {
+        if (mobStartWalk()) mobWalkStep();
+    } else if (g_mobHaveReadyAt && Clock::now() - g_mobReadyAt > kMobRebuildAfter) {
+        if (mobStartWalk()) mobWalkStep();
+    }
+
+    const auto now = Clock::now();
+    const bool due = lastBuild.time_since_epoch().count() == 0 ||
+                     now - lastBuild >= kMobEntityRefresh;
+
+    if (due) {
+        cache = buildMobEntities(cam);
+        lastBuild = now;
+        if (mobsSeen) *mobsSeen = cache.size();
+    }
+
+    out = cache;
+    for (auto& e : out)
+        e.distance = length((length(e.rootPos) > 1e-3f ? e.rootPos : e.headPos) - cam.pos);
+    return out;
+}
+
+std::vector<Entity> collectMobsNow(const Camera& cam, size_t* mobsSeen) {
+    std::vector<Entity> out;
+    if (mobsSeen) *mobsSeen = 0;
+    if (!mem::g.valid()) return out;
+    if (!mobStartWalk()) return out;
+
+    // Drive the incremental walk to completion. The guard is a safety net for a
+    // pathological graph (the queue is bounded, so this terminates on its own).
+    for (int guard = 0; guard < 200000 && g_mobWalking; ++guard)
+        mobWalkStep();
+
+    out = buildMobEntities(cam);
+    if (mobsSeen) *mobsSeen = out.size();
+    return out;
+}
+
+void setPlayerCharacters(const std::vector<uintptr_t>& models) {
+    if (models == g_playerChars) return;
+    g_playerChars = models;
+}
+
+void setReadTools(bool on) { g_readTools = on; }
 
 namespace {
 struct WindowSearch {

@@ -67,10 +67,17 @@ are applied after the file, so a flag still wins for that run.
 ## features
 
 - ESP visuals: three box styles (box / corners / 3D box), optional translucent
-  fill, head ring, health bar with numeric HP, name plate, distance, tracer,
-  distance fade, dark halo under every stroke so lines read on bright and dark
-  backgrounds, per-side colours, team check, distance limit, optional player
-  list panel.
+  fill, head ring, health bar with numeric HP (single value or `hp / max`), a
+  gradient health fill, health bar on either side, name plate, weapon/tool name,
+  distance, tracer, off-screen arrows at the viewport edge, distance fade, dark
+  halo under every stroke so lines read on bright and dark backgrounds, per-side
+  colours, team check, distance limit, optional entity list panel.
+- Mobs / NPCs: a separate scan walks Workspace for non-player humanoid rigs
+  (mobs, NPCs, bosses, dummies) and draws them with their own colour, optional
+  skeleton, name, type tag (`zombie`, `boss`, `npc`, `golem`, `animal`, `elite`,
+  `mob`) and health. The walk is incremental and bounded like the occluder cache,
+  so maps with tens of thousands of parts never stall a frame. The aimbot can
+  target mobs too, and player characters are always excluded from the mob scan.
 - ESP geometry: the box is built from the **projected joints** (width, so arms
   fit) and from the **head top to the soles of the feet** (height), with the feet
   taken from the leg/foot parts - `Humanoid.HipHeight` is 0 on R6, which is why a
@@ -104,8 +111,11 @@ are applied after the file, so a flag still wins for that run.
   position is no longer live. Games that never stream players (Rivals, typical
   Roblox places) are unaffected.
 - Aimbot: FOV limit, smoothing, bone (head/torso/root), trigger key, team check,
-  per-frame lead prediction, sticky target, and a FOV circle that is drawn from
-  its own toggle - it stays on screen with the menu closed and the aimbot off.
+  per-frame lead prediction, sticky target, target priority (crosshair /
+  distance / lowest HP), humanization jitter, optional mob targeting, and a FOV
+  circle drawn from its own toggle with a configurable colour. Triggerbot fires
+  automatically when the target enters the configured crosshair radius. The
+  circle stays on screen with the menu closed and the aimbot off.
   Smoothing is time-based, so the lock takes the same time at 60 and 144 fps,
   the first frame on a new target takes a bigger step, and a target that is not
   visible never blocks the search: the moment someone steps into view they are
@@ -127,10 +137,15 @@ are applied after the file, so a flag still wins for that run.
 - Visuals: fullbright, no fog, FOV changer (writes `Camera.FieldOfView` in
   radians and restores it on exit), custom crosshair, watermark with player
   count, fps.
-- Player: walkspeed, jumppower.
+- Player: walkspeed, jumppower, anti-AFK (one-pixel nudge every minute), auto
+  clicker (hold the bound key, 1-25 clicks/sec) and three position waypoints
+  with save / teleport buttons. Teleport writes the local HumanoidRootPart
+  position; server-side movement checks still apply.
 - `--scan` writes `offsets_report.txt` with the live chain, plus a `rig R6/R15
-  joints=n` line per player so a broken skeleton is obvious without guessing, and
-  an `occluders: n cached` line once the geometry cache is built.
+  joints=n` line per player so a broken skeleton is obvious without guessing, an
+  `occluders: n cached` line once the geometry cache is built, and a `mobs: n
+  detected` section listing every non-player rig with its classification, health
+  and distance - useful for tuning mob detection on a new game.
 
 ## offsets
 

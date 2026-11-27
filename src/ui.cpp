@@ -127,7 +127,7 @@ void panelBegin(const char* title, float x, float y, float w, float h) {
 
     // Landscape card: the height follows the last measured layout, clamped to
     // the caller's maximum.
-    g_ph = (g_contentH > 0.0f) ? std::clamp(g_contentH, 252.0f, h) : h;
+    g_ph = (g_contentH > 0.0f) ? std::clamp(g_contentH, 300.0f, h) : h;
 
     if (g_px < -g_pw + 100.0f) g_px = -g_pw + 100.0f;
     if (g_py < 0.0f) g_py = 0.0f;
