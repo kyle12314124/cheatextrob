@@ -1,22 +1,13 @@
-name: build-release
+name: build
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release tag (e.g. v1.1.0)"
-        required: true
-        default: "v1.1.0"
-      notes:
-        description: "Release notes (optional)"
-        required: false
-        default: "Mob/NPC ESP, expanded ESP + aimbot options, utility features."
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -45,12 +36,3 @@ jobs:
         with:
           name: RobloxExt
           path: ${{ steps.bin.outputs.path }}
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.version || github.ref_name }}
-          name: ELYYYKKK ${{ inputs.version || github.ref_name }}
-          body: ${{ inputs.notes || 'Automated build.' }}
-          files: ${{ steps.bin.outputs.path }}
-          fail_on_unmatched_files: true
